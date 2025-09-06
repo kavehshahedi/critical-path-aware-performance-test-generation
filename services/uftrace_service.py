@@ -1,6 +1,6 @@
 import subprocess
 import time
-import ujson
+import json
 import os
 
 
@@ -9,13 +9,13 @@ class UftraceService:
     def __init__(self, cwd=None) -> None:
         self.cwd = cwd or os.getcwd()
 
-    def _process_trace_json(self, input_file) -> None:
+    def _process_trace_json(self, input_file) -> list:
         try:
             with open(input_file, 'r') as f:
-                data = ujson.load(f)
+                data = json.load(f)
         except FileNotFoundError:
             raise Exception(f"Trace JSON file not found: {input_file}")
-        except ujson.JSONDecodeError as e:
+        except json.JSONDecodeError as e:
             raise Exception(f"Invalid JSON in trace file: {e}")
 
         if 'traceEvents' not in data:
@@ -29,10 +29,22 @@ class UftraceService:
                                if event.get('ph') in ['B', 'E']]
 
         try:
-            with open(input_file, 'w') as f:
-                ujson.dump(data['traceEvents'], f)
+            json.dump(data['traceEvents'], open(input_file, 'w'), indent=1)
         except IOError as e:
             raise Exception(f"Failed to write processed JSON: {e}")
+
+        funcs = []
+        seen = set()
+        for event in data['traceEvents']:
+            if event.get('ph') == 'B':
+                name = event['name']
+                srcline = event.get('args', {}).get('srcline', None)
+                key = (name, srcline)
+                if key not in seen:
+                    seen.add(key)
+                    funcs.append({'name': name, 'srcline': srcline})
+
+        return funcs
 
     def _run_vanilla_execution(self, command, timeout=300) -> tuple[float, subprocess.CompletedProcess]:
         try:
@@ -54,7 +66,7 @@ class UftraceService:
         except Exception as e:
             raise Exception(f"Vanilla execution failed: {e}")
 
-    def _run_instrumented_execution(self, command, output_name, timeout=400) -> tuple[float, str, subprocess.CompletedProcess[bytes]]:
+    def _run_instrumented_execution(self, command, output_name, timeout=400) -> tuple[float, str, subprocess.CompletedProcess[bytes], list]:
         try:
             process = subprocess.run(
                 command, capture_output=True, cwd=self.cwd, timeout=timeout)
@@ -70,7 +82,7 @@ class UftraceService:
 
             try:
                 with open(output_path, 'w') as f:
-                    dump_process = subprocess.run(['uftrace', 'dump', '--chrome'],
+                    dump_process = subprocess.run(['uftrace', 'dump', '--chrome', '--demangle=full', '--srcline'],
                                                   stdout=f, cwd=self.cwd, timeout=450,
                                                   stderr=subprocess.PIPE)
                 if dump_process.returncode != 0:
@@ -90,7 +102,7 @@ class UftraceService:
                     f"Trace output file was not created: {output_path}")
 
             absolute_path = os.path.abspath(output_path)
-            self._process_trace_json(absolute_path)
+            functions = self._process_trace_json(absolute_path)
 
             try:
                 stdout_lines = stdout_output.rstrip().splitlines()
@@ -102,7 +114,7 @@ class UftraceService:
             except (IndexError, ValueError) as e:
                 raise Exception(f"Failed to parse execution time: {e}")
 
-            return execution_time, absolute_path, process
+            return execution_time, absolute_path, process, functions
 
         except subprocess.TimeoutExpired:
             raise Exception(
@@ -140,7 +152,7 @@ class UftraceService:
 
                 return document
 
-            full_time, json_path, full_process = self._run_instrumented_execution(
+            full_time, json_path, full_process, functions = self._run_instrumented_execution(
                 full_command, output_name
             )
 
@@ -151,17 +163,21 @@ class UftraceService:
                     elapsed_line = stdout_lines[-3].strip()
                     try:
                         elapsed_value = elapsed_line.split(":")[1].split()[0]
-                        print(f"Elapsed time: {elapsed_value:.3f}s | Build: {build['type']} {build['range']} | Return code: {full_process.returncode}")
+                        print(
+                            f"Elapsed time: {elapsed_value:.3f}s | Build: {build['type']} {build['range']} | Return code: {full_process.returncode}")
                     except Exception:
-                        print(f"{elapsed_line} | Build: {build['type']} {build['range']} | Return code: {full_process.returncode}")
+                        print(
+                            f"{elapsed_line} | Build: {build['type']} {build['range']} | Return code: {full_process.returncode}")
                 else:
-                    print(f"Elapsed time: N/A | Build: {build['type']} {build['range']} | Return code: {full_process.returncode}")
+                    print(
+                        f"Elapsed time: N/A | Build: {build['type']} {build['range']} | Return code: {full_process.returncode}")
 
             document = {
                 'build': {'type': build['type'], 'range': build['range']},
                 'times': {'full': full_time},
                 'parameters': parameters,
                 'json_trace_path': json_path,
+                'functions': functions,
                 'success': full_process.returncode == 0
             }
 
